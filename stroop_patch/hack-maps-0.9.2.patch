@@ -1,0 +1,176 @@
+diff --git a/STROOP/Tabs/MapTab/MapAssociations.cs b/STROOP/Tabs/MapTab/MapAssociations.cs
+index 7799fee4..4139154a 100644
+--- a/STROOP/Tabs/MapTab/MapAssociations.cs
++++ b/STROOP/Tabs/MapTab/MapAssociations.cs
+@@ -8,8 +8,33 @@ using STROOP.Variables.SM64MemoryLayout;
+ 
+ namespace STROOP.Tabs.MapTab
+ {
++    // A romhack's map set (Config/MapAssociations.xml <MapHack>): recognised by words of its RAM (Signature), its
++    // maps carry hack="<name>". Added by the stroopmaps patch so that "Recommended" can pick them.
++    public class MapHack
++    {
++        public string Name;
++        public string Prefer;   // the map kind to prefer when the hack has several ("textured" or "collision")
++        public List<(uint address, uint mask, uint value)> Signature = new List<(uint, uint, uint)>();
++
++        public bool Matches()
++        {
++            if (Signature.Count == 0) return false;
++            foreach (var (address, mask, value) in Signature)
++                if ((Config.Stream.GetUInt32(address) & mask) != value) return false;
++            return true;
++        }
++    }
++
+     public class MapAssociations
+     {
++        // Marks the patched build; the stroopmaps tools look for this text in STROOP.dll (patch_status).
++        public static readonly string PatchVersion = "stroopmaps-hack-patch-1";
++
++        public readonly List<MapHack> Hacks = new List<MapHack>();
++        // <Config><HackOverride>: null or "auto" = recognise the running hack by its signature, "off" = never use
++        // a hack's maps, otherwise the name of the hack to use.
++        public string HackOverride;
++
+         public readonly Lazy<Image> BrokenBackgroundImage = new Lazy<Image>(() => Image.FromFile("Resources/Maps/broken.png"));
+         public readonly Lazy<Image> DownloadingBackgroundImage = new Lazy<Image>(() => Image.FromFile("Resources/Maps/downloading.png"));
+ 
+@@ -59,7 +84,7 @@ namespace STROOP.Tabs.MapTab
+         public MapLayout GetBestMap(byte level, byte area, ushort loadingPoint, ushort missionLayout, float y)
+         {
+             List<MapLayout> mapList = GetLevelAreaMaps(level, area, loadingPoint, missionLayout);
+-            mapList = mapList.FindAll(map => map.Y <= y);
++            mapList = mapList.FindAll(map => map.Y <= y && map.Hack == null);
+             if (mapList.Count == 0) return MapTab.MapAssociations.ROMHackMap;
+             MapLayout bestMap = mapList.First();
+             foreach (MapLayout map in mapList)
+@@ -70,17 +95,47 @@ namespace STROOP.Tabs.MapTab
+             return bestMap;
+         }
+ 
+-        public MapLayout GetBestMap()
++        public MapHack GetActiveHack()
+         {
+-            bool isRomHack = Config.Stream.GetUInt32(0x80402000) != 0;
+-            if (isRomHack)
+-                return ROMHackMap;
++            if (HackOverride == "off") return null;
++            if (!string.IsNullOrEmpty(HackOverride) && HackOverride != "auto")
++                return Hacks.Find(hack => hack.Name == HackOverride);
++            return Hacks.Find(hack => hack.Matches());
++        }
+ 
++        // The best map of a hack's set for this place, or null when the set has none here.
++        public MapLayout GetBestHackMap(MapHack hack, byte level, byte area, ushort loadingPoint, ushort missionLayout, float y)
++        {
++            List<MapLayout> mapList = GetLevelAreaMaps(level, area, loadingPoint, missionLayout);
++            mapList = mapList.FindAll(map => map.Hack == hack.Name && map.Y <= y);
++            if (hack.Prefer != null && mapList.Exists(map => map.Kind == hack.Prefer))
++                mapList = mapList.FindAll(map => map.Kind == hack.Prefer);
++            if (mapList.Count == 0) return null;
++            MapLayout bestMap = mapList.First();
++            foreach (MapLayout map in mapList)
++                if (map.Y > bestMap.Y) bestMap = map;
++            return bestMap;
++        }
++
++        public MapLayout GetBestMap()
++        {
+             byte level = Config.Stream.GetByte(MiscConfig.WarpDestinationAddress + MiscConfig.LevelOffset);
+             byte area = Config.Stream.GetByte(MiscConfig.WarpDestinationAddress + MiscConfig.AreaOffset);
+             ushort loadingPoint = Config.Stream.GetUInt16(MiscConfig.LoadingPointAddress);
+             ushort missionLayout = Config.Stream.GetUInt16(MiscConfig.MissionAddress);
+             float y = Config.Stream.GetSingle(MarioConfig.StructAddress + MarioConfig.YOffset);
++
++            MapHack activeHack = GetActiveHack();
++            if (activeHack != null)
++            {
++                MapLayout hackMap = GetBestHackMap(activeHack, level, area, loadingPoint, missionLayout, y);
++                if (hackMap != null) return hackMap;
++            }
++
++            bool isRomHack = Config.Stream.GetUInt32(0x80402000) != 0;
++            if (isRomHack)
++                return ROMHackMap;
++
+             return GetBestMap(level, area, loadingPoint, missionLayout, y);
+         }
+ 
+diff --git a/STROOP/Tabs/MapTab/MapLayout.cs b/STROOP/Tabs/MapTab/MapLayout.cs
+index 49683bcb..b96b8107 100644
+--- a/STROOP/Tabs/MapTab/MapLayout.cs
++++ b/STROOP/Tabs/MapTab/MapLayout.cs
+@@ -19,6 +19,8 @@ namespace STROOP.Tabs.MapTab
+         public float Y;
+         public string Name;
+         public string SubName;
++        public string Hack;   // the romhack's map set this map belongs to (MapHack name), null for stock maps
++        public string Kind;   // 'collision' | 'textured' (a set's maps come in these kinds)
+ 
+         public MapLayout()
+         {
+diff --git a/STROOP/Tabs/MapTab/MapTab.cs b/STROOP/Tabs/MapTab/MapTab.cs
+index 939ef586..657c095a 100644
+--- a/STROOP/Tabs/MapTab/MapTab.cs
++++ b/STROOP/Tabs/MapTab/MapTab.cs
+@@ -367,6 +367,10 @@ namespace STROOP.Tabs.MapTab
+             List<object> mapLayoutChoices = new List<object>() { "Recommended" };
+             mapLayouts.ForEach(mapLayout => mapLayoutChoices.Add(mapLayout));
+             comboBoxMapOptionsLevel.DataSource = mapLayoutChoices;
++            // stroopmaps: the list opens as wide as its longest entry (romhack map names don't fit the box)
++            comboBoxMapOptionsLevel.DropDownWidth = Math.Max(comboBoxMapOptionsLevel.Width,
++                mapLayoutChoices.Max(c => TextRenderer.MeasureText(c.ToString(), comboBoxMapOptionsLevel.Font).Width)
++                + SystemInformation.VerticalScrollBarWidth + 8);
+ 
+             // ComboBox for Background
+             List<BackgroundImage> backgroundImages = MapAssociations.GetAllBackgroundImages();
+diff --git a/STROOP/Utilities/XmlConfigParser.cs b/STROOP/Utilities/XmlConfigParser.cs
+index 836314d2..3659ce59 100644
+--- a/STROOP/Utilities/XmlConfigParser.cs
++++ b/STROOP/Utilities/XmlConfigParser.cs
+@@ -753,6 +753,9 @@ namespace STROOP.Utilities
+                                 case "BackgroundImageDirectory":
+                                     assoc.BackgroundImageFolderPath = subElement.Value;
+                                     break;
++                                case "HackOverride":
++                                    assoc.HackOverride = subElement.Value.Trim();
++                                    break;
+                                 case "DefaultImage":
+                                     var defaultMap = new MapLayout() { ImagePath = subElement.Value };
+                                     assoc.DefaultMap = defaultMap;
+@@ -770,6 +773,25 @@ namespace STROOP.Utilities
+ 
+                         break;
+ 
++                    case "MapHack":
++                        {
++                            var hack = new MapHack()
++                            {
++                                Name = element.Attribute(XName.Get("name")).Value,
++                                Prefer = element.Attribute(XName.Get("prefer"))?.Value,
++                            };
++                            foreach (XElement word in element.Elements(XName.Get("Signature")))
++                            {
++                                uint ParseWord(string text) => text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
++                                    ? Convert.ToUInt32(text.Substring(2), 16) : uint.Parse(text);
++                                uint mask = word.Attribute(XName.Get("mask")) != null ? ParseWord(word.Attribute(XName.Get("mask")).Value) : 0xFFFFFFFF;
++                                hack.Signature.Add((ParseWord(word.Attribute(XName.Get("address")).Value), mask,
++                                    ParseWord(word.Attribute(XName.Get("value")).Value) & mask));
++                            }
++                            assoc.Hacks.Add(hack);
++                        }
++                        break;
++
+                     case "Background":
+                         {
+                             string name = element.Attribute(XName.Get("name")).Value;
+@@ -816,6 +838,8 @@ namespace STROOP.Utilities
+                                 Name = name,
+                                 SubName = subName,
+                                 Background = backgroundImage,
++                                Hack = element.Attribute(XName.Get("hack"))?.Value,
++                                Kind = element.Attribute(XName.Get("kind"))?.Value,
+                             };
+ 
+                             assoc.AddAssociation(map);
